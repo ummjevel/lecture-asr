@@ -78,6 +78,13 @@ def _get_deepfilter():
     return _df_model, _df_state
 
 
+def release_model() -> None:
+    """DeepFilterNet 모델을 메모리에서 해제한다."""
+    global _df_state, _df_model
+    _df_state = None
+    _df_model = None
+
+
 def _denoise_deepfilter(
     audio: np.ndarray, sr: int, preset: str
 ) -> np.ndarray:
@@ -144,23 +151,24 @@ def process(
     audio: np.ndarray,
     sr: int,
     preset: str = "normal",
+    engine: str = "auto",
     **kwargs,
 ) -> np.ndarray:
     """노이즈 제거를 적용한다.
-
-    기본 엔진: DeepFilterNet3. 미설치 시 noisereduce로 폴백.
 
     Args:
         audio: float32 mono 오디오.
         sr: 샘플레이트 (16000).
         preset: "light" | "normal" | "strong".
+        engine: "auto" (DeepFilterNet→noisereduce 폴백) | "lightweight" (noisereduce만, 메모리 절약).
 
     Returns:
         노이즈 제거된 오디오 (float32).
     """
     engine_used = "none"
+    use_deepfilter = engine == "auto" and _HAS_DEEPFILTER
 
-    if _HAS_DEEPFILTER:
+    if use_deepfilter:
         try:
             audio = _denoise_deepfilter(audio, sr, preset)
             engine_used = "DeepFilterNet3"
@@ -177,7 +185,7 @@ def process(
                 engine_used = "none (both failed)"
     elif _HAS_NOISEREDUCE:
         audio = _denoise_noisereduce(audio, sr, preset)
-        engine_used = "noisereduce"
+        engine_used = f"noisereduce{' (lightweight)' if engine == 'lightweight' else ''}"
     else:
         warnings.warn(
             "노이즈 제거 엔진이 설치되지 않았습니다. "

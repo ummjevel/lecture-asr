@@ -149,15 +149,43 @@ class _RichUI:
     # ------------------------------------------------------------------
     def start(self) -> None:
         self._start = time.monotonic()
+        # 시작 직후부터 애니메이션 표시
+        if self._pokeball:
+            self._pokeball.state = "processing"
         self._live = Live(
             self._render(),
             console=self._console,
-            refresh_per_second=5,
+            refresh_per_second=10,
             transient=True,
+            auto_refresh=False,  # 수동 + 타이머 기반 갱신
         )
         self._live.start()
+        # 별도 스레드에서 100ms마다 렌더링 갱신 (ffmpeg 등 블로킹 중에도 애니메이션 동작)
+        import threading
+        self._refresh_stop = threading.Event()
+        self._refresh_thread = threading.Thread(target=self._auto_refresh_loop, daemon=True)
+        self._refresh_thread.start()
+
+    def _auto_refresh_loop(self) -> None:
+        """백그라운드 스레드에서 주기적으로 UI를 갱신한다."""
+        while not self._refresh_stop.is_set():
+            try:
+                # 파티클 상태 갱신 (매 프레임)
+                if self._particles:
+                    overall = self._overall_percent()
+                    state = "complete" if overall >= 100 else ("almost_done" if overall >= 80 else "processing")
+                    self._particles.update(state, overall)
+                if self._live:
+                    self._live.update(self._render())
+                    self._live.refresh()
+            except Exception:
+                pass
+            self._refresh_stop.wait(0.1)
 
     def stop(self) -> None:
+        if hasattr(self, '_refresh_stop'):
+            self._refresh_stop.set()
+            self._refresh_thread.join(timeout=1)
         if self._live:
             self._live.stop()
             self._live = None
@@ -193,17 +221,11 @@ class _RichUI:
 
         # 애니메이션 상태 갱신
         overall = self._overall_percent()
+        anim_state = "complete" if overall >= 100 else ("almost_done" if overall >= 80 else "processing")
         if self._pokeball:
-            if overall >= 100:
-                self._pokeball.state = "complete"
-            elif overall >= 80:
-                self._pokeball.state = "almost_done"
-            else:
-                self._pokeball.state = "processing"
-
+            self._pokeball.state = anim_state
         if self._particles:
-            state = "complete" if overall >= 100 else ("almost_done" if overall >= 80 else "processing")
-            self._particles.update(state, overall)
+            self._particles.update(anim_state, overall)
 
         self._refresh()
 
@@ -271,13 +293,12 @@ class _RichUI:
 
             if self._particles:
                 particle_rows = self._particles.render()
-                # 몬스터볼(5행)을 파티클 그리드(9행) 중앙에 오버레이
                 merged = self._merge_pokeball_particles(poke_lines, particle_rows)
                 for ml in merged:
-                    parts.append(Text(f"       {ml}"))
+                    parts.append(Text.from_markup(f"    {ml}"))
             else:
                 for pl in poke_lines:
-                    parts.append(Text(f"       {pl}"))
+                    parts.append(Text.from_markup(f"    {pl}"))
 
             if label:
                 parts.append(Text(f"           {label}", style="bold yellow"))
@@ -317,10 +338,8 @@ class _RichUI:
         merged: list[str] = []
         for y in range(gh):
             row = list(particle_rows[y]) if y < len(particle_rows) else [" "] * gw
-            # 오버레이: 몬스터볼 행이면 파티클 위에 덧씌움
             if y_off <= y < y_off + ph:
                 poke_row = poke_lines[y - y_off]
-                # 몬스터볼은 이모지를 포함하므로 그냥 교체
                 merged.append(poke_row)
             else:
                 merged.append("".join(row))

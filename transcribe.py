@@ -75,6 +75,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="언어 코드 (기본: ko)",
     )
     parser.add_argument(
+        "--lightweight",
+        action="store_true",
+        help="경량 노이즈 제거 (noisereduce만 사용, 메모리 절약)",
+    )
+    parser.add_argument(
+        "--asr-only",
+        action="store_true",
+        help="전처리 스킵, ASR만 실행 (이미 WAV인 경우 테스트용)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="디버그 로그 출력",
@@ -173,18 +183,34 @@ def process_file(
     tmp_wav = os.path.join(tmp_dir, f"{file_path.stem}.wav")
 
     try:
-        # --- 전처리 (1~5단계) ---
-        if _shutdown_requested:
-            return
-        audio, sr = run_preprocess(
-            input_str,
-            preset=args.denoise,
-            on_progress=ui.update_progress,
-        )
+        if args.asr_only:
+            # 전처리 스킵 — WAV면 그대로, 아니면 변환만
+            if file_path.suffix.lower() == ".wav":
+                for step in ["convert", "snr", "dereverb", "denoise", "agc"]:
+                    ui.update_progress(step, 100.0, "스킵 (--asr-only)")
+                wav_path = input_str
+            else:
+                from pipeline.converter import convert
+                ui.update_progress("convert", 5.0, "WAV 변환 중...")
+                audio, sr = convert(input_str)
+                ui.update_progress("convert", 100.0, f"변환 완료: {len(audio) / sr:.1f}초")
+                for step in ["snr", "dereverb", "denoise", "agc"]:
+                    ui.update_progress(step, 100.0, "스킵 (--asr-only)")
+                wav_path = save_preprocessed(audio, sr, tmp_wav)
+        else:
+            # --- 전처리 (1~5단계) ---
+            if _shutdown_requested:
+                return
+            audio, sr = run_preprocess(
+                input_str,
+                preset=args.denoise,
+                denoise_engine="lightweight" if args.lightweight else "auto",
+                on_progress=ui.update_progress,
+            )
 
-        if _shutdown_requested:
-            return
-        wav_path = save_preprocessed(audio, sr, tmp_wav)
+            if _shutdown_requested:
+                return
+            wav_path = save_preprocessed(audio, sr, tmp_wav)
 
         # --- ASR 전사 (6단계) ---
         if _shutdown_requested:

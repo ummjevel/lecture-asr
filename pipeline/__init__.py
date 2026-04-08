@@ -26,6 +26,7 @@ def _noop_progress(step: str, percent: float, message: str) -> None:
 def run_preprocess(
     input_path: str,
     preset: str = "normal",
+    denoise_engine: str = "auto",
     on_progress: ProgressCallback | None = None,
 ) -> tuple[np.ndarray, int]:
     """전처리 파이프라인 전체를 순차 실행한다.
@@ -35,6 +36,7 @@ def run_preprocess(
     Args:
         input_path: 입력 오디오 파일 경로 (m4a/mp3/wav 등).
         preset: "light" | "normal" | "strong" | "auto".
+        denoise_engine: "auto" (DeepFilterNet→폴백) | "lightweight" (noisereduce만).
         on_progress: 진행 콜백 ``(step, percent, message) -> None``.
 
     Returns:
@@ -43,12 +45,12 @@ def run_preprocess(
     cb = on_progress or _noop_progress
 
     # 1. 오디오 변환
-    cb("convert", 0.0, "오디오 변환 시작")
+    cb("convert", 5.0, "ffmpeg 변환 중... (시간이 걸릴 수 있습니다)")
     audio, sr = converter.convert(input_path)
     cb("convert", 100.0, f"변환 완료: {len(audio) / sr:.1f}초, {sr}Hz")
 
     # 2. SNR 측정
-    cb("snr", 0.0, "SNR 측정 중")
+    cb("snr", 10.0, "SNR 측정 중")
     snr_db = snr.estimate_snr(audio, sr)
     effective_preset = preset
 
@@ -61,19 +63,32 @@ def run_preprocess(
     logger.info("preset=%s, effective=%s, snr=%.1fdB", preset, effective_preset, snr_db)
 
     # 3. 역반향 제거
-    cb("dereverb", 0.0, "역반향 제거 중")
+    cb("dereverb", 5.0, "WPE 역반향 제거 중... (시간이 걸릴 수 있습니다)")
     audio = dereverb.process(audio, sr, preset=effective_preset)
     cb("dereverb", 100.0, "역반향 제거 완료")
 
     # 4. 노이즈 제거
-    cb("denoise", 0.0, "노이즈 제거 중")
-    audio = denoiser.process(audio, sr, preset=effective_preset)
+    engine_label = "noisereduce (경량)" if denoise_engine == "lightweight" else "자동"
+    cb("denoise", 5.0, f"노이즈 제거 중... ({engine_label})")
+    audio = denoiser.process(audio, sr, preset=effective_preset, engine=denoise_engine)
     cb("denoise", 100.0, "노이즈 제거 완료")
 
     # 5. AGC
-    cb("agc", 0.0, "볼륨 정규화 중")
+    cb("agc", 5.0, "볼륨 정규화 중...")
     audio = agc.process(audio, sr, preset=effective_preset)
     cb("agc", 100.0, "볼륨 정규화 완료")
+
+    # 전처리 완료 — 무거운 모델 메모리 해제 (ASR 모델 로딩 전)
+    denoiser.release_model()
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+    logger.info("전처리 모델 메모리 해제 완료")
 
     return audio, sr
 

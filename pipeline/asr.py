@@ -37,8 +37,64 @@ def _load_mlx_asr():
 # 기본 모델 설정
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "mlx-community/Qwen3-ASR-0.6B-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen3-ASR-0.6B-bf16"
 CHUNK_DURATION = 20 * 60  # 20분 (초)
+
+
+def _patched_load_model(model_id: str, dtype=None):
+    """lm_head.weight 누락 문제를 우회하여 모델을 로드한다."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_qwen3_asr.load_models import (
+        _resolve_path, _load_safetensors, remap_weights,
+        _read_quantization_config, _is_quantized_weights,
+    )
+    from mlx_qwen3_asr.config import Qwen3ASRConfig
+    from mlx_qwen3_asr.model import Qwen3ASRModel
+    import json
+
+    if dtype is None:
+        dtype = mx.bfloat16
+
+    model_path = _resolve_path(model_id)
+
+    with open(model_path / "config.json") as f:
+        raw_config = json.load(f)
+    config = Qwen3ASRConfig.from_dict(raw_config)
+
+    weights = _load_safetensors(model_path)
+    weights = remap_weights(weights)
+
+    # lm_head.weight 누락 시 embed_tokens에서 복사
+    if "lm_head.weight" not in weights and "model.embed_tokens.weight" in weights:
+        weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+
+    model = Qwen3ASRModel(config)
+
+    quant_cfg = _read_quantization_config(model_path)
+    quantized = _is_quantized_weights(weights)
+    if quantized:
+        bits = int(quant_cfg.get("bits", 4)) if quant_cfg else 4
+        group_size = int(quant_cfg.get("group_size", 64)) if quant_cfg else 64
+        nn.quantize(model, bits=bits, group_size=group_size)
+
+    model.load_weights(list(weights.items()))
+
+    if dtype != mx.float32 and not quantized:
+        import mlx.utils as mlx_utils
+        def _cast(x):
+            if isinstance(x, mx.array) and x.dtype in (mx.float32, mx.float16, mx.bfloat16):
+                return x.astype(dtype)
+            return x
+        params = mlx_utils.tree_map(_cast, model.parameters())
+        model.load_weights(list(mlx_utils.tree_flatten(params)))
+
+    mx.eval(model.parameters())
+    model.eval()
+    setattr(model, "_source_model_id", model_id)
+    setattr(model, "_resolved_model_path", str(model_path))
+
+    return model, config, model_path
 
 
 # ---------------------------------------------------------------------------
@@ -70,27 +126,19 @@ def transcribe(
     if on_progress:
         on_progress("transcribe", 0.0, "모델 로딩 중...")
 
-    # 모델 로드
-    model, processor = lib.load_model(model_id)
+    # 패치된 로더로 모델 로드 (lm_head.weight 누락 우회)
+    loaded_model, _config, _ = _patched_load_model(model_id)
 
     if on_progress:
         on_progress("transcribe", 5.0, "모델 로딩 완료. 전사 시작...")
 
-    # generate 인자 구성
-    generate_kwargs: dict = {
-        "language": lang,
-    }
-
-    # context biasing — 전공 용어 전달
-    if context:
-        generate_kwargs["context"] = context
-
-    # 전사 실행 (mlx-qwen3-asr 내장 청크 분할 + VAD)
-    raw_result = lib.generate_transcription(
-        model=model,
-        processor=processor,
-        audio=audio_path,
-        **generate_kwargs,
+    # 전사 실행
+    raw_result = lib.transcribe(
+        audio_path,
+        model=loaded_model,
+        language=lang,
+        context=context or "",
+        return_timestamps=True,
     )
 
     if on_progress:
