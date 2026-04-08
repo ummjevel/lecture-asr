@@ -38,6 +38,7 @@ def _load_mlx_asr():
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "mlx-community/Qwen3-ASR-0.6B-bf16"
+FORCED_ALIGNER_MODEL = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 CHUNK_DURATION = 20 * 60  # 20분 (초)
 
 
@@ -127,10 +128,24 @@ def transcribe(
         on_progress("transcribe", 0.0, "모델 로딩 중...")
 
     # 패치된 로더로 모델 로드 (lm_head.weight 누락 우회)
-    loaded_model, _config, _ = _patched_load_model(model_id)
+    import mlx.core as mx
+    loaded_model, _config, _ = _patched_load_model(model_id, dtype=mx.float16)
 
     if on_progress:
         on_progress("transcribe", 5.0, "모델 로딩 완료. 전사 시작...")
+
+    # 라이브러리 on_progress → UI 프로그레스 변환
+    def _asr_progress(event: dict) -> None:
+        if not on_progress:
+            return
+        evt = event.get("event", "")
+        if evt == "chunk_started":
+            idx = event.get("chunk_index", 0)
+            total = event.get("total_chunks", 1)
+            pct = 5.0 + (idx / total) * 85.0  # 5%~90% 범위
+            on_progress("transcribe", pct, f"전사 중... ({idx}/{total} 청크)")
+        elif evt == "completed":
+            on_progress("transcribe", 90.0, "전사 완료. 결과 정리 중...")
 
     # 전사 실행
     raw_result = lib.transcribe(
@@ -139,6 +154,9 @@ def transcribe(
         language=lang,
         context=context or "",
         return_timestamps=True,
+        forced_aligner=FORCED_ALIGNER_MODEL,
+        verbose=True,
+        on_progress=_asr_progress,
     )
 
     if on_progress:
@@ -181,6 +199,98 @@ def transcribe(
         model=model_id,
         duration=duration,
         metadata={"context": context} if context else {},
+    )
+
+    if on_progress:
+        on_progress("transcribe", 100.0, f"전사 완료 ({len(segments)}개 세그먼트)")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Whisper (mlx-whisper) 전사 엔진
+# ---------------------------------------------------------------------------
+
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+
+
+def transcribe_whisper(
+    audio_path: str,
+    lang: str = "ko",
+    on_progress: ProgressCallback | None = None,
+    model_id: str = WHISPER_MODEL,
+) -> TranscriptionResult:
+    """mlx-audio Whisper로 음성 전사.
+
+    Args:
+        audio_path: WAV 파일 경로
+        lang: 언어 코드 (기본 "ko")
+        on_progress: 진행 콜백
+        model_id: Whisper 모델 ID
+
+    Returns:
+        TranscriptionResult
+    """
+    try:
+        from mlx_audio.stt.utils import load_model
+        from mlx_audio.stt.generate import generate_transcription
+    except ImportError:
+        raise ImportError(
+            "mlx-audio가 설치되지 않았습니다. "
+            "pip install mlx-audio 로 설치하세요."
+        )
+
+    if on_progress:
+        on_progress("transcribe", 5.0, "Whisper 모델 로딩 중...")
+
+    model = load_model(model_id)
+
+    if on_progress:
+        on_progress("transcribe", 10.0, "모델 로딩 완료. 전사 중...")
+
+    raw_result = generate_transcription(
+        model=model,
+        audio=audio_path,
+        verbose=False,
+        language=lang,
+    )
+
+    if on_progress:
+        on_progress("transcribe", 95.0, "전사 완료. 결과 정리 중...")
+
+    # raw_result → TranscriptionResult 변환
+    segments: list[Segment] = []
+    if hasattr(raw_result, "segments") and raw_result.segments:
+        for seg in raw_result.segments:
+            if isinstance(seg, dict):
+                segments.append(Segment(
+                    start=seg.get("start", 0.0),
+                    end=seg.get("end", 0.0),
+                    text=seg.get("text", "").strip(),
+                ))
+            else:
+                segments.append(Segment(
+                    start=getattr(seg, "start", 0.0),
+                    end=getattr(seg, "end", 0.0),
+                    text=getattr(seg, "text", "").strip(),
+                ))
+
+    full_text = (
+        getattr(raw_result, "text", None)
+        or " ".join(s.text for s in segments)
+    )
+
+    duration = 0.0
+    if segments:
+        duration = max(s.end for s in segments)
+
+    result = TranscriptionResult(
+        text=full_text.strip(),
+        segments=segments,
+        language=lang,
+        model=model_id,
+        duration=duration,
+        metadata={},
     )
 
     if on_progress:

@@ -9,13 +9,17 @@
 
 from __future__ import annotations
 
+# HF 프로그레스바 억제 — 가장 먼저 설정
+import os
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 # 모델 캐시 디렉토리 설정 — 다른 pipeline import보다 반드시 먼저 실행
 from pipeline.cache import setup_cache
 setup_cache()
 
 import argparse
 import logging
-import os
 import signal
 import sys
 import tempfile
@@ -78,6 +82,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--lightweight",
         action="store_true",
         help="경량 노이즈 제거 (noisereduce만 사용, 메모리 절약)",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["qwen", "whisper"],
+        default="qwen",
+        help="ASR 엔진 (기본: qwen, whisper: Whisper large-v3)",
     )
     parser.add_argument(
         "--asr-only",
@@ -148,12 +158,17 @@ def _output_paths(
 # ===================================================================
 
 _shutdown_requested = False
+_ctrl_c_count = 0
 
 
 def _signal_handler(signum: int, frame) -> None:  # noqa: ANN001
-    global _shutdown_requested  # noqa: PLW0603
+    global _shutdown_requested, _ctrl_c_count  # noqa: PLW0603
+    _ctrl_c_count += 1
     _shutdown_requested = True
-    logger.info("Ctrl+C 감지 — 현재 단계 완료 후 종료합니다...")
+    if _ctrl_c_count >= 2:
+        print("\n강제 종료합니다.")
+        sys.exit(1)
+    print("\nCtrl+C 감지 — 한 번 더 누르면 즉시 종료합니다.")
 
 
 # ===================================================================
@@ -167,7 +182,7 @@ def process_file(
 ) -> None:
     """단일 오디오 파일의 전사 파이프라인을 실행한다."""
     from pipeline import run_preprocess, save_preprocessed
-    from pipeline.asr import transcribe as asr_transcribe, save_result
+    from pipeline.asr import transcribe as asr_transcribe, transcribe_whisper, save_result
     from pipeline.postprocess import postprocess
     from pipeline.llm_postprocess import postprocess_with_llm
     from pipeline.cross_validate import cross_validate
@@ -215,23 +230,43 @@ def process_file(
         # --- ASR 전사 (6단계) ---
         if _shutdown_requested:
             return
-        result = asr_transcribe(
-            wav_path,
-            lang=args.lang,
-            context=args.context,
-            on_progress=ui.update_progress,
-        )
+        if args.engine == "whisper":
+            result = transcribe_whisper(
+                wav_path,
+                lang=args.lang,
+                on_progress=ui.update_progress,
+            )
+        else:
+            result = asr_transcribe(
+                wav_path,
+                lang=args.lang,
+                context=args.context,
+                on_progress=ui.update_progress,
+            )
 
         # --- 후처리 (7단계) ---
         if _shutdown_requested:
             return
-        ui.update_progress("postprocess", 0, "시작")
-        if args.llm:
-            result = postprocess_with_llm(result, summary=args.summary,
-                                          on_progress=ui.update_progress)
+        if args.engine == "whisper":
+            # Whisper는 이미 깨끗한 텍스트 — hallucination 제거 + 필러 제거만
+            ui.update_progress("postprocess", 50.0, "후처리 중...")
+            from pipeline.postprocess import _remove_fillers, _remove_hallucination, _normalize_whitespace
+            import copy
+            processed = copy.deepcopy(result)
+            processed.text = _normalize_whitespace(_remove_hallucination(_remove_fillers(processed.text)))
+            for seg in processed.segments:
+                seg.text = _normalize_whitespace(_remove_hallucination(_remove_fillers(seg.text)))
+            processed.segments = [s for s in processed.segments if s.text.strip()]
+            result = processed
+            ui.update_progress("postprocess", 100.0, "완료")
         else:
-            result = postprocess(result, on_progress=ui.update_progress)
-        ui.update_progress("postprocess", 100, "완료")
+            ui.update_progress("postprocess", 5.0, "후처리 모델 로딩 중...")
+            if args.llm:
+                result = postprocess_with_llm(result, summary=args.summary,
+                                              on_progress=ui.update_progress)
+            else:
+                result = postprocess(result, on_progress=ui.update_progress)
+            ui.update_progress("postprocess", 100, "완료")
 
         # --- 저장 (8단계) ---
         if _shutdown_requested:
@@ -251,6 +286,9 @@ def process_file(
             out_paths.append(report_path)
 
         elapsed = time.monotonic() - start_time
+        ui.update_progress("save", 100.0, "완료!")
+        # 완료 애니메이션 (✨ + 딸깍!) 표시 후 종료
+        time.sleep(3)
         ui.stop()
         ui.show_summary(result, elapsed, output_files=[str(p) for p in out_paths])
 
@@ -298,6 +336,7 @@ def main(argv: list[str] | None = None) -> None:
         ui.show_file_info(
             str(file_path),
             preset=args.denoise,
+            engine=args.engine,
         )
         ui.start()
 
