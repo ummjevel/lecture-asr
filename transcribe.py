@@ -9,6 +9,10 @@
 
 from __future__ import annotations
 
+# 모델 캐시 디렉토리 설정 — 다른 pipeline import보다 반드시 먼저 실행
+from pipeline.cache import setup_cache
+setup_cache()
+
 import argparse
 import logging
 import os
