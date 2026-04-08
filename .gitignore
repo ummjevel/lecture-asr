@@ -1,2 +1,12 @@
 __pycache__/
 .cache/
+
+# 오디오 파일
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.wma
+*.opus
+*.aac
