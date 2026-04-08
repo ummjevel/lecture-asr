@@ -73,7 +73,8 @@ class _PlainUI:
         pass
 
     def show_file_info(self, file_path: str, duration: float = 0.0,
-                       sample_rate: int = 0, preset: str = "normal") -> None:
+                       sample_rate: int = 0, preset: str = "normal",
+                       engine: str = "qwen") -> None:
         name = os.path.basename(file_path)
         parts = [f"  파일: {name}"]
         if duration > 0:
@@ -132,6 +133,7 @@ class _RichUI:
         self._current_step: str | None = None
         self._file_info: str = ""
         self._preset: str = "normal"
+        self._engine: str = "qwen"
 
         # 몬스터볼 & 파티클 (터미널 폭 60 이상만)
         self._anim_enabled = _term_width() >= 60
@@ -156,7 +158,7 @@ class _RichUI:
             self._render(),
             console=self._console,
             refresh_per_second=10,
-            transient=True,
+            transient=False,
             auto_refresh=False,  # 수동 + 타이머 기반 갱신
         )
         self._live.start()
@@ -192,7 +194,8 @@ class _RichUI:
 
     # ------------------------------------------------------------------
     def show_file_info(self, file_path: str, duration: float = 0.0,
-                       sample_rate: int = 0, preset: str = "normal") -> None:
+                       sample_rate: int = 0, preset: str = "normal",
+                       engine: str = "qwen") -> None:
         name = os.path.basename(file_path)
         parts: list[str] = []
         if duration > 0:
@@ -203,6 +206,7 @@ class _RichUI:
         meta = ", ".join(parts)
         self._file_info = f"[bold]{name}[/bold]" + (f" ({meta})" if meta else "")
         self._preset = preset
+        self._engine = engine
         self._refresh()
 
     # ------------------------------------------------------------------
@@ -251,7 +255,7 @@ class _RichUI:
             header_lines = [
                 Text.from_markup(f"  \U0001f4c1 {self._file_info}"),
                 Text.from_markup(f"  \U0001f527 노이즈 제거: {self._preset}"),
-                Text.from_markup("  \U0001f9e0 모델: Qwen3-ASR-0.6B (4-bit)"),
+                Text.from_markup(f"  \U0001f9e0 모델: {'Whisper large-v3-turbo' if self._engine == 'whisper' else 'Qwen3-ASR-0.6B (bf16)'}"),
             ]
             for line in header_lines:
                 parts.append(line)
@@ -398,9 +402,11 @@ class TranscribeUI:
         self._impl.stop()
 
     def show_file_info(self, file_path: str, duration: float = 0.0,
-                       sample_rate: int = 0, preset: str = "normal") -> None:
+                       sample_rate: int = 0, preset: str = "normal",
+                       engine: str = "qwen") -> None:
         self._impl.show_file_info(file_path, duration=duration,
-                                  sample_rate=sample_rate, preset=preset)
+                                  sample_rate=sample_rate, preset=preset,
+                                  engine=engine)
 
     def update_progress(self, step: str, percent: float, message: str) -> None:
         self._impl.update_progress(step, percent, message)
