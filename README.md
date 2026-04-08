@@ -137,6 +137,27 @@ python transcribe.py lecture.m4a --format srt
 python transcribe.py lecture.m4a --format both
 ```
 
+### ASR 엔진 선택
+
+```bash
+# Whisper large-v3-turbo (권장 — 빠르고 한국어 품질 좋음)
+python transcribe.py lecture.m4a --engine whisper
+
+# Qwen3-ASR (기본값 — context biasing 지원)
+python transcribe.py lecture.m4a --engine qwen
+
+# 전처리 없이 ASR만 (빠른 테스트용)
+python transcribe.py lecture.wav --asr-only --engine whisper
+
+# 경량 노이즈 제거 (메모리 절약)
+python transcribe.py lecture.m4a --lightweight
+```
+
+| 엔진 | 모델 | 속도 | 한국어 품질 | 메모리 |
+|------|------|------|-----------|--------|
+| `whisper` | Whisper large-v3-turbo | 빠름 | 좋음 | ~4GB |
+| `qwen` | Qwen3-ASR-0.6B (bf16) | 느림 | 좋음 | ~10GB |
+
 ### 노이즈 제거 강도 조절
 
 강의실 환경에 따라 노이즈 제거 강도를 선택할 수 있습니다:
@@ -191,6 +212,8 @@ LLM 후처리가 하는 일:
 
 > 참고: `ANTHROPIC_API_KEY` 환경변수가 필요합니다.
 > LLM 후처리를 사용하면 기본 후처리(문장부호/필러 제거)는 LLM이 통합 수행하므로 자동 스킵됩니다.
+
+> **TODO**: LLM 교정/요약을 로컬 MLX LLM (Qwen3, Llama 등)으로 교체 예정. API 비용 없이 완전 로컬 실행 목표.
 
 ### 교차검증
 
@@ -286,10 +309,12 @@ lecture-asr/
 | 항목 | 요구사항 |
 |------|---------|
 | OS | macOS (Apple Silicon) |
-| Python | 3.10 이상 |
-| RAM | 최소 8GB, 권장 16GB |
-| 디스크 | 모델 다운로드용 ~1GB |
+| Python | 3.10~3.11 (3.12+ 일부 패키지 호환 문제) |
+| RAM | 최소 8GB, 권장 16GB+ |
+| 디스크 | 모델 다운로드용 ~2GB |
 | ffmpeg | 시스템에 설치 필요 |
+
+> **16GB 이하 RAM**: `--denoise light` 옵션 필수. 기본 노이즈 제거(DeepFilterNet)가 메모리를 많이 사용하여 OOM 크래시가 발생할 수 있습니다. Whisper 엔진(`--engine whisper`) + `--asr-only` 조합이 가장 가볍습니다.
 
 ### 메모리 사용량
 
