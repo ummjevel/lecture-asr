@@ -1,0 +1,16 @@
+# lecture-asr 의존성
+# ===== 필수 =====
+numpy
+scipy
+soundfile
+mlx-qwen3-asr[aligner]
+deepfilternet
+noisereduce
+nara_wpe
+pyagc
+deepmultilingualpunctuation
+rich
+
+# ===== 선택 (필요 시 설치) =====
+# mlx-audio              # Whisper 교차검증 (--cross-validate)
+# anthropic              # Claude API LLM 후처리 (--llm)
