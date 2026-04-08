@@ -3,14 +3,22 @@
 numpy
 scipy
 soundfile
-mlx-qwen3-asr[aligner]
-deepfilternet
-noisereduce
-nara_wpe
-pyagc
-deepmultilingualpunctuation
 rich
+noisereduce
+kss
+
+# ===== ASR 엔진 =====
+mlx-qwen3-asr[aligner]         # Qwen3-ASR (--engine qwen, 기본값)
+mlx-whisper                     # Whisper (--engine whisper)
+mlx-audio                       # Whisper large-v3-turbo-asr 지원
+
+# ===== 전처리 (선택적 — 없으면 폴백) =====
+deepfilternet                   # 노이즈 제거 (--lightweight 시 불필요)
+nara_wpe                        # 역반향 제거 (--denoise light 시 스킵)
+pyagc                           # 볼륨 정규화
+
+# ===== 후처리 =====
+deepmultilingualpunctuation     # 문장부호 복원 (Qwen 엔진용)
 
 # ===== 선택 (필요 시 설치) =====
-# mlx-audio              # Whisper 교차검증 (--cross-validate)
 # anthropic              # Claude API LLM 후처리 (--llm)
