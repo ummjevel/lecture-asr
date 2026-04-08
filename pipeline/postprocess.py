@@ -35,39 +35,69 @@ def _remove_fillers(text: str) -> str:
     return text
 
 
+def _remove_hallucination(text: str) -> str:
+    """Whisper hallucination (동일 단어/구 반복) 제거."""
+    # 같은 단어가 5회 이상 연속 반복되면 제거
+    text = re.sub(r'(\S+)(\s+\1){4,}', r'\1', text)
+    # 같은 2~4어절 구가 3회 이상 반복되면 제거
+    text = re.sub(r'((?:\S+\s+){1,4}\S+)(?:\s+\1){2,}', r'\1', text)
+    return text
+
+
 # ---------------------------------------------------------------------------
 # 문장부호 복원 (deepmultilingualpunctuation)
 # ---------------------------------------------------------------------------
 
-_punct_model = None
+_punct_pipe = None
+_PUNCT_MODEL_NAME = "oliverguhr/fullstop-punctuation-multilang-large"
 
 
-def _get_punct_model():
-    """deepmultilingualpunctuation 모델 lazy 로드."""
-    global _punct_model
-    if _punct_model is not None:
-        return _punct_model
+def _get_punct_pipe():
+    """문장부호 복원 pipeline lazy 로드 (transformers 5.x 호환)."""
+    global _punct_pipe
+    if _punct_pipe is not None:
+        return _punct_pipe
     try:
-        from deepmultilingualpunctuation import PunctuationModel
-        _punct_model = PunctuationModel()
-        return _punct_model
-    except ImportError:
+        import logging
+        logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+        from transformers import pipeline as hf_pipeline
+        _punct_pipe = hf_pipeline(
+            "token-classification",
+            model=_PUNCT_MODEL_NAME,
+            aggregation_strategy="none",
+        )
+        return _punct_pipe
+    except Exception:
         return None
 
 
 def _restore_punctuation(text: str) -> str:
     """문장부호 복원. 라이브러리 미설치 시 원본 반환."""
-    model = _get_punct_model()
-    if model is None:
-        return text
-
-    # 빈 텍스트 방어
-    if not text.strip():
+    pipe = _get_punct_pipe()
+    if pipe is None or not text.strip():
         return text
 
     try:
-        result = model.restore_punctuation(text)
-        return result
+        # 긴 텍스트는 chunk로 분할 (512 토큰 제한)
+        words = text.split()
+        chunk_size = 200  # 단어 기준
+        chunks = [words[i:i+chunk_size] for i in range(0, len(words), chunk_size)]
+
+        result_parts = []
+        for chunk in chunks:
+            chunk_text = " ".join(chunk)
+            labeled = pipe(chunk_text)
+            for item in labeled:
+                word = item["word"].strip()
+                label = item.get("entity", "O")
+                if not word:
+                    continue
+                # label: 0 (no punct), PERIOD, COMMA, QUESTION, EXCLAMATION
+                punct_map = {"PERIOD": ".", "COMMA": ",", "QUESTION": "?", "EXCLAMATION": "!"}
+                punct = punct_map.get(label, "")
+                result_parts.append(word + punct)
+
+        return " ".join(result_parts)
     except Exception:
         return text
 
@@ -90,6 +120,8 @@ def _normalize_whitespace(text: str) -> str:
 
 def _clean_text(text: str) -> str:
     """최종 텍스트 클리닝."""
+    # sentencepiece 토큰 구분자 제거
+    text = text.replace("▁", " ")
     # 반복 구두점 정리: "..." → ".", "??" → "?"
     text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\?{2,}', '?', text)
@@ -106,12 +138,22 @@ def _clean_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _correct_spacing(text: str) -> str:
+    """한국어 띄어쓰기 교정. kss 미설치 시 원본 반환."""
+    try:
+        import kss
+        return kss.correct_spacing(text)
+    except Exception:
+        return text
+
+
 def _process_segment_text(text: str, use_punct: bool = True) -> str:
     """단일 텍스트 블록에 전체 후처리 파이프라인 적용."""
     text = _remove_fillers(text)
+    text = _clean_text(text)
+    text = _correct_spacing(text)
     if use_punct:
         text = _restore_punctuation(text)
-    text = _clean_text(text)
     text = _normalize_whitespace(text)
     return text
 
@@ -140,7 +182,7 @@ def postprocess(
     processed = copy.deepcopy(result)
 
     # deepmultilingualpunctuation 사용 가능 여부 확인
-    punct_available = _get_punct_model() is not None
+    punct_available = _get_punct_pipe() is not None
 
     if on_progress:
         status = "문장부호 복원 포함" if punct_available else "문장부호 복원 스킵 (미설치)"
