@@ -11,23 +11,32 @@ from scipy.signal import butter, sosfilt
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# 선택적 의존성 탐색
+# 선택적 의존성 탐색 (lazy — import 시점에 torch 로드 방지)
 # ------------------------------------------------------------------
-_HAS_DEEPFILTER = False
-try:
-    from df.enhance import enhance, init_df, load_audio, save_audio  # noqa: F401
+_HAS_DEEPFILTER: bool | None = None  # None = 미확인
+_HAS_NOISEREDUCE: bool | None = None
 
-    _HAS_DEEPFILTER = True
-except ImportError:
-    pass
 
-_HAS_NOISEREDUCE = False
-try:
-    import noisereduce as nr  # noqa: F401
+def _check_deepfilter() -> bool:
+    global _HAS_DEEPFILTER
+    if _HAS_DEEPFILTER is None:
+        try:
+            from df.enhance import enhance, init_df  # noqa: F401
+            _HAS_DEEPFILTER = True
+        except ImportError:
+            _HAS_DEEPFILTER = False
+    return _HAS_DEEPFILTER
 
-    _HAS_NOISEREDUCE = True
-except ImportError:
-    pass
+
+def _check_noisereduce() -> bool:
+    global _HAS_NOISEREDUCE
+    if _HAS_NOISEREDUCE is None:
+        try:
+            import noisereduce  # noqa: F401
+            _HAS_NOISEREDUCE = True
+        except ImportError:
+            _HAS_NOISEREDUCE = False
+    return _HAS_NOISEREDUCE
 
 # ------------------------------------------------------------------
 # 프리셋별 파라미터
@@ -74,6 +83,7 @@ def _get_deepfilter():
     """DeepFilterNet 모델을 싱글톤으로 초기화."""
     global _df_state, _df_model
     if _df_state is None:
+        from df.enhance import init_df
         _df_model, _df_state, _ = init_df()
     return _df_model, _df_state
 
@@ -90,6 +100,7 @@ def _denoise_deepfilter(
 ) -> np.ndarray:
     """DeepFilterNet3으로 노이즈 제거."""
     import torch
+    from df.enhance import enhance
 
     model, state = _get_deepfilter()
     params = _DEEPFILTER_PARAMS.get(preset, _DEEPFILTER_PARAMS["normal"])
@@ -133,6 +144,8 @@ def _denoise_noisereduce(
     audio: np.ndarray, sr: int, preset: str
 ) -> np.ndarray:
     """noisereduce로 노이즈 제거 (폴백)."""
+    import noisereduce as nr
+
     params = _NOISEREDUCE_PARAMS.get(preset, _NOISEREDUCE_PARAMS["normal"])
 
     result = nr.reduce_noise(
@@ -165,16 +178,21 @@ def process(
     Returns:
         노이즈 제거된 오디오 (float32).
     """
-    engine_used = "none"
-    use_deepfilter = engine == "auto" and _HAS_DEEPFILTER
+    if preset == "light":
+        logger.info("denoiser: light 프리셋 — 스킵")
+        return audio
 
-    if use_deepfilter:
+    engine_used = "none"
+    has_df = engine == "auto" and _check_deepfilter()
+    has_nr = _check_noisereduce()
+
+    if has_df:
         try:
             audio = _denoise_deepfilter(audio, sr, preset)
             engine_used = "DeepFilterNet3"
         except Exception as exc:
             logger.warning("DeepFilterNet3 실패, noisereduce로 폴백: %s", exc)
-            if _HAS_NOISEREDUCE:
+            if has_nr:
                 audio = _denoise_noisereduce(audio, sr, preset)
                 engine_used = "noisereduce (fallback)"
             else:
@@ -183,7 +201,7 @@ def process(
                     stacklevel=2,
                 )
                 engine_used = "none (both failed)"
-    elif _HAS_NOISEREDUCE:
+    elif has_nr:
         audio = _denoise_noisereduce(audio, sr, preset)
         engine_used = f"noisereduce{' (lightweight)' if engine == 'lightweight' else ''}"
     else:
