@@ -1,0 +1,21 @@
+[project]
+name = "lecture-asr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "noisereduce>=3.0.3",
+    "numpy>=2.0.2",
+    "rich>=14.3.3",
+    "scipy>=1.13.1",
+    "soundfile>=0.13.1",
+]
+
+[project.optional-dependencies]
+cross-validate = [
+    "mlx-audio>=0.2.9",
+]
+llm = [
+    "anthropic>=0.91.0",
+]
