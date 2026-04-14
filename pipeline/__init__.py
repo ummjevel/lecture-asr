@@ -10,7 +10,7 @@ from typing import Callable
 import numpy as np
 import soundfile as sf
 
-from pipeline import converter, snr, dereverb, denoiser, agc
+from pipeline import converter, snr, dereverb, denoiser, click_remover, crosstalk, agc
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,16 @@ def run_preprocess(
     audio = denoiser.process(audio, sr, preset=effective_preset, engine=denoise_engine)
     cb("denoise", 100.0, "노이즈 제거 완료")
 
+    # 4.5 클릭 제거 (키보드/마우스 충격 소음)
+    if effective_preset != "light":
+        cb("denoise", 100.0, "클릭 소음 제거 중...")
+        audio = click_remover.process(audio, sr, preset=effective_preset)
+
+    # 4.6 크로스토크 감쇠 (배경 대화)
+    if effective_preset != "light":
+        cb("denoise", 100.0, "크로스토크 감쇠 중...")
+        audio = crosstalk.process(audio, sr, preset=effective_preset)
+
     # 5. AGC
     cb("agc", 5.0, "볼륨 정규화 중...")
     audio = agc.process(audio, sr, preset=effective_preset)
@@ -80,14 +90,16 @@ def run_preprocess(
 
     # 전처리 완료 — 무거운 모델 메모리 해제 (ASR 모델 로딩 전)
     denoiser.release_model()
-    import gc
+    import gc, sys
     gc.collect()
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except Exception:
-        pass
+    # torch가 이미 로드된 경우에만 MPS 캐시 해제 (torch를 새로 import하지 않음)
+    if "torch" in sys.modules:
+        try:
+            torch = sys.modules["torch"]
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
     logger.info("전처리 모델 메모리 해제 완료")
 
     return audio, sr
