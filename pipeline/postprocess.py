@@ -36,11 +36,19 @@ def _remove_fillers(text: str) -> str:
 
 
 def _remove_hallucination(text: str) -> str:
-    """Whisper hallucination (동일 단어/구 반복) 제거."""
-    # 같은 단어가 5회 이상 연속 반복되면 제거
-    text = re.sub(r'(\S+)(\s+\1){4,}', r'\1', text)
-    # 같은 2~4어절 구가 3회 이상 반복되면 제거
-    text = re.sub(r'((?:\S+\s+){1,4}\S+)(?:\s+\1){2,}', r'\1', text)
+    """Whisper hallucination (동일 단어/구 반복, 깨진 문자) 제거."""
+    # 같은 단어가 3회 이상 연속 반복되면 1회로
+    text = re.sub(r'(\S+)(\s+\1){2,}', r'\1', text)
+    # 같은 2~6어절 구가 2회 이상 반복되면 1회로
+    text = re.sub(r'((?:\S+\s+){1,6}\S+)(?:\s+\1){1,}', r'\1', text)
+    # 같은 한글 글자가 5회 이상 연속이면 제거 (예: "에에에에에")
+    text = re.sub(r'([가-힣])\1{4,}', '', text)
+    # 깨진 유니코드 문자 제거 (replacement character 등)
+    text = re.sub(r'[�\ufffd]+', '', text)
+    # <|th|> 같은 Whisper 토큰 잔여물 제거
+    text = re.sub(r'<\|[^|]*\|>', '', text)
+    # "밖에 없거든요" 류의 반복 문장 패턴 (같은 문장이 .으로 끝나고 반복)
+    text = re.sub(r'((?:[^.!?]+[.!?])\s*)\1{1,}', r'\1', text)
     return text
 
 
