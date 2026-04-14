@@ -36,6 +36,29 @@ _WPE_PARAMS: dict[str, dict] = {
 _STFT_SIZE = 512
 _STFT_SHIFT = 128
 
+# 청크 분할 파라미터 (메모리 제한)
+_CHUNK_SEC = 300  # 5분 단위 청크
+_OVERLAP_SEC = 2  # 2초 오버랩 (크로스페이드)
+
+
+def _process_chunk(
+    chunk: np.ndarray, params: dict,
+) -> np.ndarray:
+    """단일 청크에 WPE 역반향 제거를 적용한다."""
+    chunk_len = len(chunk)
+    chunk_64 = chunk.astype(np.float64)
+    signal = chunk_64[np.newaxis, :]
+
+    Y = stft(signal, size=_STFT_SIZE, shift=_STFT_SHIFT)
+    Z = wpe(
+        Y,
+        taps=params["taps"],
+        delay=params["delay"],
+        iterations=params["iterations"],
+    )
+    result = istft(Z, size=_STFT_SIZE, shift=_STFT_SHIFT)
+    return result[0, :chunk_len].astype(np.float32)
+
 
 def process(
     audio: np.ndarray,
@@ -44,6 +67,8 @@ def process(
     **kwargs,
 ) -> np.ndarray:
     """역반향 제거를 적용한다.
+
+    5분 단위 청크로 분할 처리하여 메모리 사용량을 제한한다.
 
     Args:
         audio: float32 mono 오디오.
@@ -67,31 +92,52 @@ def process(
         return audio
 
     params = _WPE_PARAMS.get(preset, _WPE_PARAMS["normal"])
-    logger.info("dereverb: preset=%s, params=%s", preset, params)
-
     original_len = len(audio)
-    audio_64 = audio.astype(np.float64)
 
-    # mono → (1, T) 형태로 변환 (nara_wpe는 다채널 입력을 기대)
-    signal = audio_64[np.newaxis, :]
+    chunk_samples = _CHUNK_SEC * sr
+    overlap_samples = _OVERLAP_SEC * sr
 
-    # STFT
-    Y = stft(signal, size=_STFT_SIZE, shift=_STFT_SHIFT)
-    # Y shape: (channels, frames, freq_bins)
+    # 짧은 오디오는 한번에 처리
+    if original_len <= chunk_samples + overlap_samples:
+        logger.info("dereverb: preset=%s (단일 청크)", preset)
+        return _process_chunk(audio, params)
 
-    # WPE 역반향 제거
-    Z = wpe(
-        Y,
-        taps=params["taps"],
-        delay=params["delay"],
-        iterations=params["iterations"],
-    )
+    # 청크 분할 + 크로스페이드
+    n_chunks = 0
+    pos = 0
+    while pos < original_len:
+        n_chunks += 1
+        pos += chunk_samples
+    logger.info("dereverb: preset=%s, %d 청크 (%.0f초 단위)", preset, n_chunks, _CHUNK_SEC)
 
-    # iSTFT
-    result = istft(Z, size=_STFT_SIZE, shift=_STFT_SHIFT)
+    output = np.zeros(original_len, dtype=np.float32)
+    pos = 0
 
-    # mono 채널 추출 + 원래 길이로 트리밍
-    out = result[0, :original_len].astype(np.float32)
+    while pos < original_len:
+        # 청크 범위 (오버랩 포함)
+        end = min(pos + chunk_samples + overlap_samples, original_len)
+        chunk = audio[pos:end]
 
-    logger.info("dereverb done: %d samples", len(out))
-    return out
+        processed = _process_chunk(chunk, params)
+
+        if pos == 0:
+            # 첫 청크: 그대로 복사
+            output[:len(processed)] = processed
+        else:
+            # 오버랩 구간 크로스페이드
+            fade_len = min(overlap_samples, len(processed), original_len - pos)
+            if fade_len > 0:
+                fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                output[pos:pos + fade_len] = (
+                    output[pos:pos + fade_len] * fade_out
+                    + processed[:fade_len] * fade_in
+                )
+            # 오버랩 이후 구간
+            remaining = processed[fade_len:]
+            output[pos + fade_len:pos + fade_len + len(remaining)] = remaining
+
+        pos += chunk_samples
+
+    logger.info("dereverb done: %d samples", original_len)
+    return output
