@@ -118,6 +118,13 @@ class _PlainUI:
 # Rich UI
 # ===================================================================
 
+_ENGINE_LABELS = {
+    "ko-whisper": "Whisper-medium-komixv2 (한국어)",
+    "whisper": "Whisper large-v3-turbo",
+    "qwen": "Qwen3-ASR-0.6B (bf16)",
+}
+
+
 class _RichUI:
     """rich.live.Live 기반 실시간 터미널 UI."""
 
@@ -185,12 +192,24 @@ class _RichUI:
             self._refresh_stop.wait(0.1)
 
     def stop(self) -> None:
+        # 1) 먼저 Live를 멈춰서 백그라운드 스레드가 더 이상 self._live.refresh()를
+        #    호출하지 못하게 한다. 백그라운드 루프는 예외를 swallow하므로 안전.
+        live = self._live
+        self._live = None
         if hasattr(self, '_refresh_stop'):
             self._refresh_stop.set()
-            self._refresh_thread.join(timeout=1)
-        if self._live:
-            self._live.stop()
-            self._live = None
+            self._refresh_thread.join(timeout=2)
+            if self._refresh_thread.is_alive():
+                # 좀비 스레드 — daemon이므로 프로세스 종료 시 회수되지만 로깅
+                import logging
+                logging.getLogger(__name__).warning(
+                    "UI refresh thread did not exit within timeout"
+                )
+        if live:
+            try:
+                live.stop()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def show_file_info(self, file_path: str, duration: float = 0.0,
@@ -255,7 +274,7 @@ class _RichUI:
             header_lines = [
                 Text.from_markup(f"  \U0001f4c1 {self._file_info}"),
                 Text.from_markup(f"  \U0001f527 노이즈 제거: {self._preset}"),
-                Text.from_markup(f"  \U0001f9e0 모델: {'Whisper large-v3-turbo' if self._engine == 'whisper' else 'Qwen3-ASR-0.6B (bf16)'}"),
+                Text.from_markup(f"  \U0001f9e0 모델: {_ENGINE_LABELS.get(self._engine, self._engine)}"),
             ]
             for line in header_lines:
                 parts.append(line)
@@ -380,6 +399,245 @@ class _RichUI:
             border_style="green",
         )
         self._console.print(panel)
+
+
+# ===================================================================
+# 배치 처리 UI
+# ===================================================================
+
+# 파일 상태 상수
+_ST_PENDING = "pending"
+_ST_PREPROCESS = "preprocess"
+_ST_ASR = "asr"
+_ST_POSTPROCESS = "postprocess"
+_ST_DONE = "done"
+_ST_ERROR = "error"
+
+_STATUS_ICONS = {
+    _ST_PENDING: "\u23f3",      # ⏳
+    _ST_PREPROCESS: "\U0001f527",  # 🔧
+    _ST_ASR: "\U0001f9e0",      # 🧠
+    _ST_POSTPROCESS: "\u270f\ufe0f",  # ✏️
+    _ST_DONE: "\u2705",         # ✅
+    _ST_ERROR: "\u274c",        # ❌
+}
+
+_STATUS_LABELS = {
+    _ST_PENDING: "대기",
+    _ST_PREPROCESS: "전처리 중",
+    _ST_ASR: "전사 중",
+    _ST_POSTPROCESS: "후처리 중",
+    _ST_DONE: "완료",
+    _ST_ERROR: "실패",
+}
+
+
+class _BatchPlainUI:
+    """rich 없이 배치 진행상황을 표시하는 폴백 UI."""
+
+    def __init__(self, file_names: list[str], workers: int) -> None:
+        self._files = file_names
+        self._workers = workers
+        self._statuses: dict[str, str] = {f: _ST_PENDING for f in file_names}
+        self._messages: dict[str, str] = {}
+        self._start = time.monotonic()
+
+    def start(self) -> None:
+        self._start = time.monotonic()
+        n = len(self._files)
+        print(f"\n  배치 모드: {n}개 파일, {self._workers} 워커")
+
+    def stop(self) -> None:
+        pass
+
+    def update_file(self, file_name: str, status: str, message: str = "") -> None:
+        self._statuses[file_name] = status
+        self._messages[file_name] = message
+        icon = _STATUS_ICONS.get(status, "?")
+        label = _STATUS_LABELS.get(status, status)
+        print(f"  {icon} {file_name}: {label}" + (f" — {message}" if message else ""))
+
+    def show_batch_summary(
+        self,
+        results: dict[str, object],
+        elapsed: float,
+        output_files: dict[str, list[str]],
+    ) -> None:
+        m, s = divmod(int(elapsed), 60)
+        done = sum(1 for st in self._statuses.values() if st == _ST_DONE)
+        total = len(self._files)
+        print(f"\n  배치 완료: {done}/{total} 성공 ({m}분 {s:02d}초)")
+        for fname, paths in output_files.items():
+            for p in paths:
+                print(f"  -> {p}")
+
+
+class _BatchRichUI:
+    """rich.live 기반 배치 진행상황 UI."""
+
+    def __init__(self, file_names: list[str], workers: int) -> None:
+        self._console = Console()
+        self._files = file_names
+        self._workers = workers
+        self._statuses: dict[str, str] = {f: _ST_PENDING for f in file_names}
+        self._messages: dict[str, str] = {f: "" for f in file_names}
+        self._start = time.monotonic()
+        self._live: Live | None = None
+        self._phase: str = ""  # "preprocess" | "asr" | ""
+        self._phase_progress: float = 0.0  # 현재 phase 내 진행률
+
+    def start(self) -> None:
+        self._start = time.monotonic()
+        self._live = Live(
+            self._render(),
+            console=self._console,
+            refresh_per_second=4,
+            transient=False,
+        )
+        self._live.start()
+
+    def stop(self) -> None:
+        if self._live:
+            self._live.stop()
+            self._live = None
+
+    def set_phase(self, phase: str, progress: float = 0.0) -> None:
+        self._phase = phase
+        self._phase_progress = progress
+        self._refresh()
+
+    def update_file(self, file_name: str, status: str, message: str = "") -> None:
+        self._statuses[file_name] = status
+        self._messages[file_name] = message
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self._live:
+            self._live.update(self._render())
+
+    def _render(self) -> Panel:
+        parts: list = []
+        total = len(self._files)
+        done = sum(1 for st in self._statuses.values() if st == _ST_DONE)
+        errors = sum(1 for st in self._statuses.values() if st == _ST_ERROR)
+
+        # 헤더
+        parts.append(Text.from_markup(
+            f"  [bold]{total}[/bold]개 파일  |  "
+            f"[bold]{self._workers}[/bold] 워커  |  "
+            f"Phase: [cyan]{self._phase or '준비'}[/cyan]"
+        ))
+        parts.append(Text(""))
+
+        # 파일별 상태
+        for fname in self._files:
+            st = self._statuses[fname]
+            msg = self._messages.get(fname, "")
+            icon = _STATUS_ICONS.get(st, "?")
+            label = _STATUS_LABELS.get(st, st)
+
+            # 파일명 자르기 (너무 길면)
+            display_name = fname if len(fname) <= 30 else f"...{fname[-27:]}"
+
+            if st == _ST_DONE:
+                line = f"  {icon} [green]{display_name:<30s}[/green] [green]{label}[/green]"
+            elif st == _ST_ERROR:
+                line = f"  {icon} [red]{display_name:<30s}[/red] [red]{label}[/red]"
+                if msg:
+                    line += f" [dim]({msg})[/dim]"
+            elif st == _ST_PENDING:
+                line = f"  {icon} [dim]{display_name:<30s} {label}[/dim]"
+            else:
+                line = f"  {icon} [bold]{display_name:<30s}[/bold] [cyan]{label}[/cyan]"
+                if msg:
+                    line += f" [dim]— {msg}[/dim]"
+
+            parts.append(Text.from_markup(line))
+
+        # 전체 진행률 바
+        parts.append(Text(""))
+        elapsed = time.monotonic() - self._start
+        m, s = divmod(int(elapsed), 60)
+        overall = (done / total * 100) if total > 0 else 0
+        bar_w = 27
+        filled = int(bar_w * overall / 100)
+        bar_full = "━" * filled
+        bar_empty = "░" * (bar_w - filled)
+        parts.append(Text.from_markup(
+            f"  전체: [cyan]{bar_full}[/cyan]{bar_empty} "
+            f"{done}/{total} 완료"
+            + (f"  [red]{errors} 실패[/red]" if errors else "")
+            + f"  {m}:{s:02d} 경과"
+        ))
+
+        return Panel(
+            Group(*parts),
+            title="배치 전사",
+            border_style="blue",
+        )
+
+    def show_batch_summary(
+        self,
+        results: dict[str, object],
+        elapsed: float,
+        output_files: dict[str, list[str]],
+    ) -> None:
+        m, s = divmod(int(elapsed), 60)
+        done = sum(1 for st in self._statuses.values() if st == _ST_DONE)
+        errors = sum(1 for st in self._statuses.values() if st == _ST_ERROR)
+        total = len(self._files)
+
+        lines: list[str] = [
+            f"  \u2705 배치 완료: {done}/{total} 성공 ({m}분 {s:02d}초)"
+        ]
+        if errors:
+            lines.append(f"  \u274c {errors}개 실패")
+
+        for fname in self._files:
+            paths = output_files.get(fname, [])
+            if paths:
+                lines.append(f"  \U0001f4c1 {fname}")
+                for p in paths:
+                    base = os.path.basename(p)
+                    lines.append(f"     -> {base}")
+
+        panel = Panel(
+            "\n".join(lines),
+            title="배치 결과 요약",
+            border_style="green",
+        )
+        self._console.print(panel)
+
+
+class BatchUI:
+    """배치 처리 UI. rich 유무에 따라 자동 선택."""
+
+    def __init__(self, file_names: list[str], workers: int) -> None:
+        if _HAS_RICH:
+            self._impl = _BatchRichUI(file_names, workers)
+        else:
+            self._impl = _BatchPlainUI(file_names, workers)
+
+    def start(self) -> None:
+        self._impl.start()
+
+    def stop(self) -> None:
+        self._impl.stop()
+
+    def set_phase(self, phase: str, progress: float = 0.0) -> None:
+        if hasattr(self._impl, "set_phase"):
+            self._impl.set_phase(phase, progress)
+
+    def update_file(self, file_name: str, status: str, message: str = "") -> None:
+        self._impl.update_file(file_name, status, message)
+
+    def show_batch_summary(
+        self,
+        results: dict[str, object],
+        elapsed: float,
+        output_files: dict[str, list[str]],
+    ) -> None:
+        self._impl.show_batch_summary(results, elapsed, output_files)
 
 
 # ===================================================================

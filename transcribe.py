@@ -9,10 +9,12 @@
 
 from __future__ import annotations
 
-# HF 프로그레스바 억제 — 가장 먼저 설정
+# 환경변수 — 가장 먼저 설정
 import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # OpenMP 중복 로딩 우회 (mlx + torch)
 
 # 모델 캐시 디렉토리 설정 — 다른 pipeline import보다 반드시 먼저 실행
 from pipeline.cache import setup_cache
@@ -85,14 +87,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--engine",
-        choices=["qwen", "whisper"],
+        choices=["qwen", "whisper", "ko-whisper"],
         default="qwen",
-        help="ASR 엔진 (기본: qwen, whisper: Whisper large-v3)",
+        help="ASR 엔진 (기본: qwen, whisper: Whisper large-v3, ko-whisper: 한국어 특화 Whisper)",
     )
     parser.add_argument(
         "--asr-only",
         action="store_true",
         help="전처리 스킵, ASR만 실행 (이미 WAV인 경우 테스트용)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="배치 병렬 전처리 워커 수 (기본: auto, 0=자동)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -182,7 +190,7 @@ def process_file(
 ) -> None:
     """단일 오디오 파일의 전사 파이프라인을 실행한다."""
     from pipeline import run_preprocess, save_preprocessed
-    from pipeline.asr import transcribe as asr_transcribe, transcribe_whisper, save_result
+    from pipeline.asr import transcribe as asr_transcribe, transcribe_whisper, transcribe_ko_whisper, save_result
     from pipeline.postprocess import postprocess
     from pipeline.llm_postprocess import postprocess_with_llm
     from pipeline.cross_validate import cross_validate
@@ -230,7 +238,13 @@ def process_file(
         # --- ASR 전사 (6단계) ---
         if _shutdown_requested:
             return
-        if args.engine == "whisper":
+        if args.engine == "ko-whisper":
+            result = transcribe_ko_whisper(
+                wav_path,
+                lang=args.lang,
+                on_progress=ui.update_progress,
+            )
+        elif args.engine == "whisper":
             result = transcribe_whisper(
                 wav_path,
                 lang=args.lang,
@@ -247,8 +261,8 @@ def process_file(
         # --- 후처리 (7단계) ---
         if _shutdown_requested:
             return
-        if args.engine == "whisper":
-            # Whisper는 이미 깨끗한 텍스트 — hallucination 제거 + 필러 제거만
+        if args.engine in ("whisper", "ko-whisper"):
+            # Whisper 계열은 이미 깨끗한 텍스트 — hallucination 제거 + 필러 제거만
             ui.update_progress("postprocess", 50.0, "후처리 중...")
             from pipeline.postprocess import _remove_fillers, _remove_hallucination, _normalize_whitespace
             import copy
@@ -303,6 +317,228 @@ def process_file(
 
 
 # ===================================================================
+# 배치 전처리 워커 (별도 프로세스에서 실행)
+# ===================================================================
+
+def _preprocess_worker(
+    input_path: str,
+    output_wav: str,
+    preset: str,
+    denoise_engine: str,
+) -> tuple[str, str | None]:
+    """전처리를 실행하고 결과 WAV 경로를 반환한다.
+
+    Returns:
+        (file_name, wav_path) — 성공 시 wav_path, 실패 시 None.
+    """
+    file_name = os.path.basename(input_path)
+    try:
+        from pipeline import run_preprocess, save_preprocessed
+        audio, sr = run_preprocess(input_path, preset=preset, denoise_engine=denoise_engine)
+        wav_path = save_preprocessed(audio, sr, output_wav)
+        return (file_name, wav_path)
+    except Exception as exc:
+        logger.error("전처리 실패: %s — %s", file_name, exc)
+        return (file_name, None)
+
+
+def _resolve_workers(requested: int, file_count: int) -> int:
+    """워커 수를 결정한다."""
+    if requested > 0:
+        return min(requested, file_count)
+    cpu = os.cpu_count() or 4
+    return min(cpu // 2, file_count, 3)
+
+
+# ===================================================================
+# 배치 파이프라인
+# ===================================================================
+
+def process_batch(
+    files: list[Path],
+    args: argparse.Namespace,
+) -> None:
+    """여러 파일을 Phase1(전처리 병렬) → Phase2(ASR 순차) → 저장으로 처리한다."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from pipeline.asr import transcribe as asr_transcribe, transcribe_whisper, transcribe_ko_whisper, save_result
+    from pipeline.postprocess import postprocess
+    from pipeline.llm_postprocess import postprocess_with_llm
+    from pipeline.cross_validate import cross_validate
+    from ui.progress import BatchUI
+
+    file_names = [f.name for f in files]
+    workers = _resolve_workers(args.workers, len(files))
+
+    batch_ui = BatchUI(file_names, workers)
+    batch_ui.start()
+    batch_start = time.monotonic()
+
+    # 임시 디렉토리
+    tmp_dir = tempfile.mkdtemp(prefix="lecture-asr-batch-")
+
+    # wav_path 매핑: file_name → wav_path
+    wav_map: dict[str, str] = {}
+    results: dict[str, object] = {}
+    output_files: dict[str, list[str]] = {}
+
+    try:
+        # ============================================================
+        # Phase 1: 전처리 병렬
+        # ============================================================
+        batch_ui.set_phase("전처리 (병렬)")
+
+        if args.asr_only:
+            # 전처리 스킵
+            for fp in files:
+                fname = fp.name
+                if fp.suffix.lower() == ".wav":
+                    wav_map[fname] = str(fp)
+                else:
+                    from pipeline.converter import convert
+                    from pipeline import save_preprocessed
+                    batch_ui.update_file(fname, "preprocess", "WAV 변환 중...")
+                    audio, sr = convert(str(fp))
+                    tmp_wav = os.path.join(tmp_dir, f"{fp.stem}.wav")
+                    wav_map[fname] = save_preprocessed(audio, sr, tmp_wav)
+                batch_ui.update_file(fname, "done" if args.asr_only else "preprocess", "전처리 스킵")
+        else:
+            # 병렬 전처리
+            futures = {}
+            executor = ProcessPoolExecutor(max_workers=workers)
+            try:
+                for fp in files:
+                    fname = fp.name
+                    tmp_wav = os.path.join(tmp_dir, f"{fp.stem}.wav")
+                    batch_ui.update_file(fname, "preprocess", "대기 중...")
+                    future = executor.submit(
+                        _preprocess_worker,
+                        str(fp),
+                        tmp_wav,
+                        args.denoise,
+                        "lightweight" if args.lightweight else "auto",
+                    )
+                    futures[future] = fname
+
+                for future in as_completed(futures):
+                    if _shutdown_requested:
+                        for f in futures:
+                            f.cancel()
+                        break
+                    fname = futures[future]
+                    try:
+                        file_name, wav_path = future.result()
+                    except Exception as exc:
+                        batch_ui.update_file(fname, "error", f"전처리 실패: {exc}")
+                        continue
+                    if wav_path:
+                        wav_map[fname] = wav_path
+                        batch_ui.update_file(fname, "preprocess", "전처리 완료")
+                    else:
+                        batch_ui.update_file(fname, "error", "전처리 실패")
+            finally:
+                # 셧다운 요청 시 워커 즉시 종료, 정상 시 완료 대기
+                executor.shutdown(
+                    wait=not _shutdown_requested,
+                    cancel_futures=_shutdown_requested,
+                )
+
+        if _shutdown_requested:
+            batch_ui.stop()
+            print("\n중단됨.")
+            return
+
+        # ============================================================
+        # Phase 2: ASR 순차
+        # ============================================================
+        batch_ui.set_phase("ASR 전사 (순차)")
+
+        for fp in files:
+            if _shutdown_requested:
+                break
+            fname = fp.name
+            wav_path = wav_map.get(fname)
+            if not wav_path:
+                continue  # 전처리 실패한 파일은 스킵
+
+            batch_ui.update_file(fname, "asr", "전사 중...")
+
+            try:
+                if args.engine == "ko-whisper":
+                    result = transcribe_ko_whisper(wav_path, lang=args.lang)
+                elif args.engine == "whisper":
+                    result = transcribe_whisper(wav_path, lang=args.lang)
+                else:
+                    result = asr_transcribe(
+                        wav_path, lang=args.lang, context=args.context,
+                    )
+                results[fname] = result
+                batch_ui.update_file(fname, "postprocess", "후처리 중...")
+            except Exception as exc:
+                batch_ui.update_file(fname, "error", str(exc)[:50])
+                logger.error("ASR 실패: %s — %s", fname, exc)
+                continue
+
+            # --- 후처리 ---
+            try:
+                if args.engine in ("whisper", "ko-whisper"):
+                    from pipeline.postprocess import _remove_fillers, _remove_hallucination, _normalize_whitespace
+                    import copy
+                    processed = copy.deepcopy(result)
+                    processed.text = _normalize_whitespace(_remove_hallucination(_remove_fillers(processed.text)))
+                    for seg in processed.segments:
+                        seg.text = _normalize_whitespace(_remove_hallucination(_remove_fillers(seg.text)))
+                    processed.segments = [s for s in processed.segments if s.text.strip()]
+                    result = processed
+                elif args.llm:
+                    result = postprocess_with_llm(result, summary=args.summary)
+                else:
+                    result = postprocess(result)
+
+                results[fname] = result
+            except Exception as exc:
+                logger.error("후처리 실패: %s — %s", fname, exc)
+
+            # --- 저장 ---
+            out_paths = _output_paths(fp, args.format, summary=args.summary)
+            saved: list[str] = []
+            for op in out_paths:
+                fmt = "srt" if op.suffix == ".srt" else "txt"
+                save_result(result, str(op), format=fmt)
+                saved.append(str(op))
+
+            # --- 교차검증 ---
+            if args.cross_validate:
+                try:
+                    report = cross_validate(wav_path, result)
+                    report_path = fp.parent / f"{fp.stem}_report.txt"
+                    with open(report_path, "w", encoding="utf-8") as f:
+                        f.write(report if isinstance(report, str) else str(report))
+                    saved.append(str(report_path))
+                except Exception as exc:
+                    logger.error("교차검증 실패: %s — %s", fname, exc)
+
+            output_files[fname] = saved
+            batch_ui.update_file(fname, "done", "완료")
+
+        # ============================================================
+        # 결과 요약
+        # ============================================================
+        elapsed = time.monotonic() - batch_start
+        batch_ui.stop()
+        batch_ui.show_batch_summary(results, elapsed, output_files)
+
+    finally:
+        # 임시 파일 정리
+        try:
+            for wav in wav_map.values():
+                if wav.startswith(tmp_dir) and os.path.isfile(wav):
+                    os.unlink(wav)
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
+# ===================================================================
 # main
 # ===================================================================
 
@@ -318,20 +554,22 @@ def main(argv: list[str] | None = None) -> None:
     # Ctrl+C 핸들러
     signal.signal(signal.SIGINT, _signal_handler)
 
-    # UI 초기화
-    from ui.progress import TranscribeUI
-    ui = TranscribeUI()
-
     files = collect_files(args.input)
     total = len(files)
+
+    # 배치 모드: 파일 2개 이상
+    if total >= 2:
+        process_batch(files, args)
+        return
+
+    # 단일 파일 모드 (기존 동작)
+    from ui.progress import TranscribeUI
+    ui = TranscribeUI()
 
     for idx, file_path in enumerate(files, 1):
         if _shutdown_requested:
             print("\n중단됨 — 이전까지 처리된 결과는 저장되어 있습니다.")
             break
-
-        if total > 1:
-            print(f"\n[{idx}/{total}] {file_path.name}")
 
         ui.show_file_info(
             str(file_path),
@@ -343,15 +581,15 @@ def main(argv: list[str] | None = None) -> None:
         try:
             process_file(file_path, args, ui)
         except KeyboardInterrupt:
-            ui.stop()
             print("\n중단됨.")
             break
         except Exception as exc:
-            ui.stop()
             logger.error("처리 실패: %s — %s", file_path.name, exc)
             if args.verbose:
                 import traceback
                 traceback.print_exc()
+        finally:
+            ui.stop()  # 항상 백그라운드 스레드/Live 해제 — 멱등 호출
 
 
 if __name__ == "__main__":

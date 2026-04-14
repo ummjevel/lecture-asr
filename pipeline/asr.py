@@ -147,37 +147,65 @@ def transcribe(
         elif evt == "completed":
             on_progress("transcribe", 90.0, "전사 완료. 결과 정리 중...")
 
-    # 전사 실행
-    raw_result = lib.transcribe(
-        audio_path,
-        model=loaded_model,
-        language=lang,
-        context=context or "",
-        return_timestamps=True,
-        forced_aligner=FORCED_ALIGNER_MODEL,
-        verbose=True,
-        on_progress=_asr_progress,
-    )
+    # 전사 실행 (verbose=False로 stdout 누출 방지)
+    # forced_aligner 로딩 실패 시 stdout/stderr 억제 후 타임스탬프 없이 재시도
+    import io, sys
+    try:
+        _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        try:
+            raw_result = lib.transcribe(
+                audio_path,
+                model=loaded_model,
+                language=lang,
+                context=context or "",
+                return_timestamps=True,
+                forced_aligner=FORCED_ALIGNER_MODEL,
+                verbose=False,
+                on_progress=_asr_progress,
+            )
+        finally:
+            sys.stdout, sys.stderr = _orig_stdout, _orig_stderr
+    except Exception:
+        sys.stdout, sys.stderr = _orig_stdout, _orig_stderr
+        if on_progress:
+            on_progress("transcribe", 8.0, "Aligner 실패 — 타임스탬프 없이 재시도...")
+        raw_result = lib.transcribe(
+            audio_path,
+            model=loaded_model,
+            language=lang,
+            context=context or "",
+            return_timestamps=False,
+            verbose=False,
+            on_progress=_asr_progress,
+        )
 
     if on_progress:
         on_progress("transcribe", 90.0, "전사 완료. 결과 정리 중...")
 
     # raw_result → TranscriptionResult 변환
     segments: list[Segment] = []
-    if hasattr(raw_result, "segments"):
-        for seg in raw_result.segments:
-            segments.append(Segment(
-                start=seg.get("start", seg.get("t0", 0.0)),
-                end=seg.get("end", seg.get("t1", 0.0)),
-                text=seg.get("text", "").strip(),
-            ))
-    elif isinstance(raw_result, dict) and "segments" in raw_result:
-        for seg in raw_result["segments"]:
-            segments.append(Segment(
-                start=seg.get("start", seg.get("t0", 0.0)),
-                end=seg.get("end", seg.get("t1", 0.0)),
-                text=seg.get("text", "").strip(),
-            ))
+    raw_segments = None
+    if hasattr(raw_result, "segments") and raw_result.segments:
+        raw_segments = raw_result.segments
+    elif isinstance(raw_result, dict) and raw_result.get("segments"):
+        raw_segments = raw_result["segments"]
+
+    if raw_segments:
+        for seg in raw_segments:
+            if isinstance(seg, dict):
+                segments.append(Segment(
+                    start=seg.get("start", seg.get("t0", 0.0)),
+                    end=seg.get("end", seg.get("t1", 0.0)),
+                    text=seg.get("text", "").strip(),
+                ))
+            else:
+                segments.append(Segment(
+                    start=getattr(seg, "start", getattr(seg, "t0", 0.0)),
+                    end=getattr(seg, "end", getattr(seg, "t1", 0.0)),
+                    text=getattr(seg, "text", "").strip(),
+                ))
 
     full_text = (
         getattr(raw_result, "text", None)
@@ -212,6 +240,44 @@ def transcribe(
 # ---------------------------------------------------------------------------
 
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+KO_WHISPER_MODEL = "youngouk/whisper-medium-komixv2-mlx"
+
+
+def _patch_tqdm(on_progress: ProgressCallback | None):
+    """tqdm.tqdm을 monkey-patch하여 stderr 출력 억제 + on_progress 전달.
+
+    contextmanager로 사용: with _patch_tqdm(cb): ...
+    """
+    import contextlib
+    import tqdm as tqdm_mod
+
+    @contextlib.contextmanager
+    def _ctx():
+        orig_tqdm = tqdm_mod.tqdm
+
+        class _SilentTqdm(orig_tqdm):
+            def __init__(self, *args, **kwargs):
+                kwargs["disable"] = True  # stderr 출력 억제
+                super().__init__(*args, **kwargs)
+                self._total_frames = kwargs.get("total") or (args[0] if args else None)
+                self._accumulated = 0
+
+            def update(self, n=1):
+                self._accumulated += n
+                if on_progress and self._total_frames:
+                    # 10%~90% 범위로 매핑
+                    pct = 10.0 + (self._accumulated / self._total_frames) * 80.0
+                    on_progress("transcribe", min(pct, 90.0),
+                                f"전사 중... ({self._accumulated}/{self._total_frames} 프레임)")
+                return super().update(n)
+
+        tqdm_mod.tqdm = _SilentTqdm
+        try:
+            yield
+        finally:
+            tqdm_mod.tqdm = orig_tqdm
+
+    return _ctx()
 
 
 def transcribe_whisper(
@@ -248,12 +314,13 @@ def transcribe_whisper(
     if on_progress:
         on_progress("transcribe", 10.0, "모델 로딩 완료. 전사 중...")
 
-    raw_result = generate_transcription(
-        model=model,
-        audio=audio_path,
-        verbose=False,
-        language=lang,
-    )
+    with _patch_tqdm(on_progress):
+        raw_result = generate_transcription(
+            model=model,
+            audio=audio_path,
+            verbose=False,
+            language=lang,
+        )
 
     if on_progress:
         on_progress("transcribe", 95.0, "전사 완료. 결과 정리 중...")
@@ -295,6 +362,164 @@ def transcribe_whisper(
 
     if on_progress:
         on_progress("transcribe", 100.0, f"전사 완료 ({len(segments)}개 세그먼트)")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 한국어 특화 Whisper (mlx_whisper) 전사 엔진
+# ---------------------------------------------------------------------------
+
+
+def transcribe_ko_whisper(
+    audio_path: str,
+    lang: str = "ko",
+    on_progress: ProgressCallback | None = None,
+    model_id: str = KO_WHISPER_MODEL,
+) -> TranscriptionResult:
+    """한국어 특화 Whisper (whisper-medium-komixv2-mlx)로 음성 전사.
+
+    mlx_whisper 패키지를 사용한다 (mlx-audio와 별도).
+
+    Args:
+        audio_path: WAV 파일 경로
+        lang: 언어 코드 (기본 "ko")
+        on_progress: 진행 콜백
+        model_id: 모델 ID
+
+    Returns:
+        TranscriptionResult
+    """
+    try:
+        import mlx_whisper
+    except ImportError:
+        raise ImportError(
+            "mlx-whisper가 설치되지 않았습니다. "
+            "pip install mlx-whisper 로 설치하세요."
+        )
+
+    import gc
+    import soundfile as sf
+    import tempfile
+
+    if on_progress:
+        on_progress("transcribe", 5.0, "한국어 Whisper 모델 로딩 중...")
+
+    # 오디오 길이 확인 → 긴 파일은 청크 분할 (메모리 보호)
+    info = sf.info(audio_path)
+    total_duration = info.duration
+    chunk_sec = 300  # 5분 단위
+
+    if on_progress:
+        on_progress("transcribe", 10.0, "모델 로딩 완료. 전사 중...")
+
+    all_segments: list[Segment] = []
+    all_texts: list[str] = []
+
+    if total_duration <= chunk_sec + 30:
+        # 짧은 오디오: 한번에 처리
+        with _patch_tqdm(on_progress):
+            raw_result = mlx_whisper.transcribe(
+                audio_path,
+                path_or_hf_repo=model_id,
+                language=lang,
+                verbose=False,
+                word_timestamps=False,
+                condition_on_previous_text=False,
+                hallucination_silence_threshold=2.0,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.0,
+            )
+        all_texts.append(raw_result.get("text", ""))
+        for seg in raw_result.get("segments", []):
+            all_segments.append(Segment(
+                start=seg.get("start", 0.0),
+                end=seg.get("end", 0.0),
+                text=seg.get("text", "").strip(),
+            ))
+    else:
+        # 긴 오디오: 5분 청크로 분할 처리 — 전체 로드 없이 파일에서 청크 단위로 읽는다
+        import math
+        sr = info.samplerate
+        total_frames = info.frames
+        chunk_frames = int(chunk_sec * sr)
+        n_chunks = math.ceil(total_frames / chunk_frames)
+
+        with sf.SoundFile(audio_path) as snd:
+            for i in range(n_chunks):
+                start_frame = i * chunk_frames
+                end_frame = min(start_frame + chunk_frames, total_frames)
+                time_offset = i * chunk_sec
+
+                if on_progress:
+                    pct = 10.0 + (i / n_chunks) * 80.0
+                    on_progress("transcribe", pct,
+                                f"전사 중... ({i + 1}/{n_chunks} 청크)")
+
+                snd.seek(start_frame)
+                chunk = snd.read(frames=end_frame - start_frame, dtype="float32", always_2d=False)
+                if chunk.ndim > 1:
+                    chunk = chunk.mean(axis=1)
+
+                # 청크를 임시 WAV로 저장 — 생성 직후 try/finally로 보호
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".wav", delete=False, prefix="ko-whisper-chunk-",
+                )
+                tmp_name = tmp.name
+                tmp.close()
+                chunk_result = None
+                try:
+                    sf.write(tmp_name, chunk, sr, subtype="PCM_16")
+                    # chunk는 write 이후 더 이상 필요 없으므로 즉시 해제
+                    del chunk
+                    with _patch_tqdm(None):  # 청크별 tqdm 억제
+                        chunk_result = mlx_whisper.transcribe(
+                            tmp_name,
+                            path_or_hf_repo=model_id,
+                            language=lang,
+                            verbose=False,
+                            word_timestamps=False,
+                            condition_on_previous_text=False,
+                            hallucination_silence_threshold=2.0,
+                            no_speech_threshold=0.6,
+                            compression_ratio_threshold=2.0,
+                        )
+                finally:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+
+                if chunk_result is not None:
+                    all_texts.append(chunk_result.get("text", ""))
+                    for seg in chunk_result.get("segments", []):
+                        all_segments.append(Segment(
+                            start=seg.get("start", 0.0) + time_offset,
+                            end=seg.get("end", 0.0) + time_offset,
+                            text=seg.get("text", "").strip(),
+                        ))
+
+                # 청크 간 메모리 해제
+                del chunk_result
+                gc.collect()
+
+    if on_progress:
+        on_progress("transcribe", 95.0, "전사 완료. 결과 정리 중...")
+
+    full_text = " ".join(all_texts).strip() or " ".join(s.text for s in all_segments)
+    duration = max((s.end for s in all_segments), default=0.0)
+
+    result = TranscriptionResult(
+        text=full_text,
+        segments=all_segments,
+        language=lang,
+        model=model_id,
+        duration=duration,
+        metadata={},
+    )
+
+    if on_progress:
+        on_progress("transcribe", 100.0, f"전사 완료 ({len(all_segments)}개 세그먼트)")
 
     return result
 

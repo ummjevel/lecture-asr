@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -67,44 +68,54 @@ def convert(
     input_path = str(Path(input_path).resolve())
     ffmpeg = _ffmpeg_bin()
 
-    # 출력 경로 결정
+    # 출력 경로 결정 — 임시 파일 생성 시 실패 경로에서 정리 책임을 진다
+    owns_tmp = False
     if output_path is None:
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         output_path = tmp.name
         tmp.close()
+        owns_tmp = True
     else:
         output_path = str(Path(output_path).resolve())
 
-    # 소스 정보 확인
-    info = _probe(input_path)
-    src_sr = int(info.get("sample_rate", 0)) if info else 0
-    src_ch = int(info.get("channels", 0)) if info else 0
+    try:
+        # 소스 정보 확인
+        info = _probe(input_path)
+        src_sr = int(info.get("sample_rate", 0)) if info else 0
+        src_ch = int(info.get("channels", 0)) if info else 0
 
-    logger.info(
-        "convert: %s → %s (src %dHz %dch)",
-        input_path, output_path, src_sr, src_ch,
-    )
+        logger.info(
+            "convert: %s → %s (src %dHz %dch)",
+            input_path, output_path, src_sr, src_ch,
+        )
 
-    # ffmpeg 명령어 구성
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", input_path,
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-ar", str(_TARGET_SR),
-        "-ac", str(_TARGET_CHANNELS),
-        "-sample_fmt", "s16",
-        "-f", "wav",
-        output_path,
-    ]
+        # ffmpeg 명령어 구성
+        cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-ar", str(_TARGET_SR),
+            "-ac", str(_TARGET_CHANNELS),
+            "-sample_fmt", "s16",
+            "-f", "wav",
+            output_path,
+        ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()}")
 
-    # soundfile로 로드
-    audio, sr = sf.read(output_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+        # soundfile로 로드
+        audio, sr = sf.read(output_path, dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
 
-    logger.info("convert done: %.1fs, %dHz", len(audio) / sr, sr)
-    return audio, sr
+        logger.info("convert done: %.1fs, %dHz", len(audio) / sr, sr)
+        return audio, sr
+    except Exception:
+        if owns_tmp:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+        raise
